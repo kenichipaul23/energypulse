@@ -109,6 +109,66 @@ FEATURE_COLUMNS = [
     "temperature",
 ]
 
+
+# ---------------------------------------------------------------------------
+# Feature-based (non-timeseries) pipeline
+# ---------------------------------------------------------------------------
+_DOW_MAP = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+_BINARY_MAP = {
+    "yes": 1, "no": 0, "on": 1, "off": 0, "true": 1, "false": 0, "1": 1, "0": 0,
+}
+
+
+def build_feature_table_tabular(raw_df: pd.DataFrame, target_col: str = "consumption") -> pd.DataFrame:
+    """
+    Builds a model-ready feature table for datasets that describe each
+    reading with independent columns (Month, Hour, DayOfWeek, Temperature,
+    Occupancy, Holiday, HVACUsage, ...) rather than a real timestamp.
+
+    No lag/rolling features are computed here -- there is no reliable
+    chronological order to compute them from. Every row is treated as an
+    independent observation instead.
+    """
+    df = raw_df.copy()
+    feature_cols = []
+
+    # numeric calendar-like columns -> cyclical encoding
+    if "Hour" in df.columns:
+        df["hour_sin"] = np.sin(2 * np.pi * df["Hour"] / 24)
+        df["hour_cos"] = np.cos(2 * np.pi * df["Hour"] / 24)
+        feature_cols += ["hour_sin", "hour_cos"]
+
+    if "Month" in df.columns:
+        df["month_sin"] = np.sin(2 * np.pi * df["Month"] / 12)
+        df["month_cos"] = np.cos(2 * np.pi * df["Month"] / 12)
+        feature_cols += ["month_sin", "month_cos"]
+
+    if "DayOfWeek" in df.columns:
+        dow_num = df["DayOfWeek"].astype(str).str.lower().map(_DOW_MAP)
+        df["dow_sin"] = np.sin(2 * np.pi * dow_num / 7)
+        df["dow_cos"] = np.cos(2 * np.pi * dow_num / 7)
+        feature_cols += ["dow_sin", "dow_cos"]
+
+    # Yes/No, On/Off style columns -> binary
+    for col in ["Holiday", "HVACUsage", "LightingUsage"]:
+        if col in df.columns:
+            new_col = f"{col}_bin"
+            df[new_col] = df[col].astype(str).str.lower().map(_BINARY_MAP).fillna(0)
+            feature_cols.append(new_col)
+
+    # plain numeric columns, used as-is
+    for col in ["Temperature", "Humidity", "SquareFootage", "Occupancy", "RenewableEnergy"]:
+        if col in df.columns:
+            feature_cols.append(col)
+
+    df = add_peak_load_label(df, target_col=target_col)
+    df = df.dropna(subset=feature_cols + [target_col]).reset_index(drop=True)
+    return df, feature_cols
+
+
 if __name__ == "__main__":
     from data_utils import generate_synthetic_dataset
 
