@@ -36,10 +36,26 @@ except ImportError:
 
 
 def chronological_split(df: pd.DataFrame, test_size: float = 0.2):
-    """Split a time-ordered dataframe into train/test without shuffling."""
+    """Split a time-ordered dataframe into train/test without shuffling.
+    Use this whenever row order == real chronological order (e.g. genuine
+    hourly meter logs), so the model is always tested on the future."""
     df = df.sort_values("timestamp").reset_index(drop=True)
     split_idx = int(len(df) * (1 - test_size))
     return df.iloc[:split_idx].copy(), df.iloc[split_idx:].copy()
+
+
+def random_split(df: pd.DataFrame, test_size: float = 0.2, seed: int = 42):
+    """Shuffled train/test split for datasets that do NOT have a genuine
+    chronological row order (e.g. tabular datasets where each row is an
+    independent simulated reading with descriptive Month/Hour/DayOfWeek
+    columns, rather than a real timestamp). Rows are shuffled for the split
+    itself, then re-sorted by timestamp only so charts still draw cleanly."""
+    from sklearn.model_selection import train_test_split
+    train_df, test_df = train_test_split(df, test_size=test_size, random_state=seed, shuffle=True)
+    return (
+        train_df.sort_values("timestamp").reset_index(drop=True),
+        test_df.sort_values("timestamp").reset_index(drop=True),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -119,8 +135,8 @@ def evaluate_classification_model(model, test_df, feature_cols, target_col="load
 # ---------------------------------------------------------------------------
 # Convenience: run the full pipeline end-to-end
 # ---------------------------------------------------------------------------
-def run_full_pipeline(feature_df, feature_cols):
-    train_df, test_df = chronological_split(feature_df, test_size=0.2)
+def run_full_pipeline(feature_df, feature_cols, split_fn=chronological_split):
+    train_df, test_df = split_fn(feature_df, test_size=0.2)
 
     fc_model = train_forecasting_model(train_df, feature_cols)
     fc_metrics, fc_preds = evaluate_forecasting_model(fc_model, test_df, feature_cols)
