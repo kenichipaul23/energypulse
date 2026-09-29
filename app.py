@@ -18,9 +18,12 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from data_utils import generate_synthetic_dataset, load_csv_dataset
-from features import build_feature_table, add_time_features, add_lag_and_rolling_features, FEATURE_COLUMNS
-from models import run_full_pipeline, chronological_split
+from data_utils import generate_synthetic_dataset, load_csv_dataset, load_tabular_dataset
+from features import (
+    build_feature_table, build_feature_table_tabular,
+    add_time_features, add_lag_and_rolling_features, FEATURE_COLUMNS,
+)
+from models import run_full_pipeline, chronological_split, random_split
 import theme
 from theme import COLORS
 
@@ -53,17 +56,28 @@ data_source = st.sidebar.radio(
          "explore the whole app before you have a real dataset.",
 )
 
+tabular_mode = False  # True = dataset has no real timestamp (feature-based CSV)
+
 if data_source == "Upload CSV":
     uploaded = st.sidebar.file_uploader(
         "Upload your dataset (CSV)", type=["csv"],
-        help="Needs at least a timestamp column and a consumption/load column. "
-             "Column names are auto-detected.",
+        help="Works with either a real hourly time series (timestamp + "
+             "consumption columns) or a feature-based dataset (Month/Hour/"
+             "DayOfWeek + a consumption column). Both are auto-detected.",
     )
     if uploaded is None:
-        st.sidebar.info("Upload a CSV with timestamp + consumption columns, "
-                         "or switch to demo data to explore the app first.")
+        st.sidebar.info("Upload a CSV, or switch to demo data to explore the app first.")
         st.stop()
-    raw_df = load_csv_dataset(uploaded)
+    try:
+        # Try #1: a genuine time-series dataset with a real timestamp column.
+        raw_df = load_csv_dataset(uploaded)
+    except ValueError:
+        # Try #2: a feature-based dataset (Month/Hour/DayOfWeek columns
+        # instead of a real timestamp) -- common for Kaggle-style synthetic
+        # "energy consumption" datasets.
+        uploaded.seek(0)
+        raw_df = load_tabular_dataset(uploaded)
+        tabular_mode = True
 else:
     days = st.sidebar.slider(
         "Days of synthetic history", 60, 730, 365, step=30,
@@ -92,11 +106,30 @@ st.sidebar.markdown(
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
+if tabular_mode:
+    badge_text = "Live dashboard · your data (feature-based mode)"
+elif data_source == "Upload CSV":
+    badge_text = "Live dashboard · your data (time-series mode)"
+else:
+    badge_text = "Live dashboard · demo data"
+
 theme.hero(
     title="EnergyPulse",
     tagline="Web-based commercial power consumption forecasting & peak-load classification",
-    badge="Live dashboard · demo data" if data_source != "Upload CSV" else "Live dashboard · your data",
+    badge=badge_text,
 )
+
+if tabular_mode:
+    theme.callout(
+        "<b>Feature-based mode detected.</b> Your file doesn't contain a real "
+        "timestamp — instead each row describes an hour with separate columns "
+        "(Month, Hour, DayOfWeek, Temperature, etc.). EnergyPulse switched to a "
+        "matching pipeline automatically: predictions are made straight from "
+        "those columns instead of from recent history, and the train/test "
+        "split is randomized instead of chronological (since there's no "
+        "reliable time order to split on).",
+        accent=COLORS["cyan"],
+    )
 
 tab_overview, tab_forecast, tab_classify, tab_about = st.tabs(
     ["📊  Overview", "🔮  Forecasting", "🚦  Peak-Load Classification", "ℹ️  About"]
@@ -118,13 +151,22 @@ with tab_overview:
     col3.metric("🔻 Min Consumption", f"{building_df['consumption'].min():.1f} kW")
     col4.metric("🗂️ Records", f"{len(building_df):,}")
 
-    theme.section(
-        "Consumption over time",
-        "Every hourly reading in the dataset, left to right. Look for the daily "
-        "'spikes' (business hours) and any longer-term rise or fall across months.",
-    )
+    if tabular_mode:
+        theme.section(
+            "Consumption by row order",
+            "Your file has no real dates, so this just plots the readings in the "
+            "order they appear in the CSV — useful for spotting outliers, not for "
+            "reading actual dates off the x-axis.",
+        )
+    else:
+        theme.section(
+            "Consumption over time",
+            "Every hourly reading in the dataset, left to right. Look for the daily "
+            "'spikes' (business hours) and any longer-term rise or fall across months.",
+        )
     fig = px.line(building_df, x="timestamp", y="consumption",
-                   labels={"consumption": "Consumption (kW)", "timestamp": "Time"})
+                   labels={"consumption": "Consumption (kW)",
+                           "timestamp": "Row order" if tabular_mode else "Time"})
     fig.update_traces(line=dict(color=COLORS["amber"], width=1.2))
     st.plotly_chart(theme.style_fig(fig, height=340), use_container_width=True)
 
@@ -135,7 +177,9 @@ with tab_overview:
             "Which hours typically draw the most power — useful for spotting the "
             "building's daily operating rhythm.",
         )
-        hourly = building_df.assign(hour=building_df["timestamp"].dt.hour).groupby("hour")["consumption"].mean()
+        hour_series = building_df["Hour"] if tabular_mode and "Hour" in building_df.columns \
+            else building_df["timestamp"].dt.hour
+        hourly = building_df.assign(hour=hour_series).groupby("hour")["consumption"].mean()
         fig2 = px.bar(hourly, labels={"value": "Avg kW", "hour": "Hour of Day"})
         fig2.update_traces(marker_color=COLORS["cyan"])
         st.plotly_chart(theme.style_fig(fig2, height=300).update_layout(showlegend=False),
@@ -147,8 +191,14 @@ with tab_overview:
             "reflects real operating patterns.",
         )
         dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        dow = building_df.assign(dow=building_df["timestamp"].dt.dayofweek).groupby("dow")["consumption"].mean()
-        dow.index = [dow_names[i] for i in dow.index]
+        if tabular_mode and "DayOfWeek" in building_df.columns:
+            dow = building_df.groupby("DayOfWeek")["consumption"].mean()
+            dow = dow.reindex(["Monday", "Tuesday", "Wednesday", "Thursday",
+                                "Friday", "Saturday", "Sunday"])
+            dow.index = dow_names
+        else:
+            dow = building_df.assign(dow=building_df["timestamp"].dt.dayofweek).groupby("dow")["consumption"].mean()
+            dow.index = [dow_names[i] for i in dow.index]
         fig3 = px.bar(dow, labels={"value": "Avg kW", "index": "Day"})
         fig3.update_traces(marker_color=COLORS["cyan"])
         st.plotly_chart(theme.style_fig(fig3, height=300).update_layout(showlegend=False),
@@ -158,19 +208,21 @@ with tab_overview:
 # Build features + train models once, share across tabs (cached)
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def _build_features(df):
-    return build_feature_table(df)
+def _build_features(df, _tabular_mode):
+    if _tabular_mode:
+        return build_feature_table_tabular(df)
+    return build_feature_table(df), FEATURE_COLUMNS
 
 
 @st.cache_resource(show_spinner=False)
-def _train_models(cache_key, _feature_df):
+def _train_models(cache_key, _feature_df, _feature_cols, _split_fn):
     # `_feature_df` is underscore-prefixed so Streamlit skips hashing it
     # (large DataFrame); `cache_key` is the cheap hashable value that
     # actually determines cache invalidation.
-    return run_full_pipeline(_feature_df, FEATURE_COLUMNS)
+    return run_full_pipeline(_feature_df, _feature_cols, split_fn=_split_fn)
 
 
-feature_df = _build_features(building_df)
+feature_df, feature_cols = _build_features(building_df, tabular_mode)
 
 if len(feature_df) < 200:
     st.warning("Not enough data after feature engineering (need lag history of at least 1 week). "
@@ -178,8 +230,9 @@ if len(feature_df) < 200:
     st.stop()
 
 with st.spinner("Training forecasting & classification models..."):
-    cache_key = f"{selected_building}_{len(feature_df)}_{feature_df['timestamp'].iloc[-1]}"
-    results = _train_models(cache_key, feature_df)
+    cache_key = f"{selected_building}_{len(feature_df)}_{tabular_mode}"
+    split_fn = random_split if tabular_mode else chronological_split
+    results = _train_models(cache_key, feature_df, feature_cols, split_fn)
 
 # ---------------------------------------------------------------------------
 # TAB 2: Forecasting
@@ -197,12 +250,18 @@ with tab_forecast:
     c1.metric("MAE", f"{m['MAE']} kW", help="Mean Absolute Error — on average, how far off each prediction is, in kW.")
     c2.metric("RMSE", f"{m['RMSE']} kW", help="Root Mean Squared Error — like MAE, but penalizes big misses more.")
     c3.metric("MAPE", f"{m['MAPE_%']}%", help="Mean Absolute Percentage Error — the average error as a % of actual usage.")
+    split_desc = (
+        "a randomized 80/20 split (your file has no reliable time order, so rows "
+        "were shuffled before splitting)"
+        if tabular_mode else
+        "a chronological 80/20 split (no shuffling, so the test period is always "
+        "in the future relative to training)"
+    )
     st.markdown(
         f'<p class="ep-muted" style="font-size:0.85rem;">Model: '
         f'<b style="color:{COLORS["text"]};">'
         f'{"XGBoost" if results["using_xgboost"] else "Gradient Boosting (scikit-learn)"}</b> '
-        f'Regressor · trained on a chronological 80/20 split (no shuffling, so the '
-        f'test period is always in the future relative to training).</p>',
+        f'Regressor · trained on {split_desc}.</p>',
         unsafe_allow_html=True,
     )
 
@@ -231,7 +290,7 @@ with tab_forecast:
     )
     fc_model = results["forecasting_model"]
     if hasattr(fc_model, "feature_importances_"):
-        imp = pd.Series(fc_model.feature_importances_, index=FEATURE_COLUMNS).sort_values()
+        imp = pd.Series(fc_model.feature_importances_, index=feature_cols).sort_values()
         fig5 = px.bar(imp, orientation="h", labels={"value": "Importance", "index": "Feature"})
         fig5.update_traces(marker_color=COLORS["cyan"])
         st.plotly_chart(theme.style_fig(fig5, height=400).update_layout(showlegend=False),
@@ -262,10 +321,12 @@ with tab_classify:
     c2.metric("Precision", cm_metrics["Precision_macro"], help="Of the hours predicted as a class, how many really were.")
     c3.metric("Recall", cm_metrics["Recall_macro"], help="Of the hours that really were a class, how many were caught.")
     c4.metric("F1 Score", cm_metrics["F1_macro"], help="Balance between precision and recall — higher is better.")
+    eval_desc = "the same randomly held-out rows as the forecast" if tabular_mode \
+        else "the same held-out future period as the forecast"
     st.markdown(
         f'<p class="ep-muted" style="font-size:0.85rem;">Model: '
         f'<b style="color:{COLORS["text"]};">Random Forest Classifier</b> · '
-        f'evaluated on the same held-out future period as the forecast.</p>',
+        f'evaluated on {eval_desc}.</p>',
         unsafe_allow_html=True,
     )
 
@@ -327,7 +388,9 @@ with tab_about:
          "synthetic data so the app works before real data is ready."),
         ("2", "Engineer features", "features.py",
          "Builds calendar features (hour, day of week, season), lag features "
-         "(usage 1h / 24h / 1 week ago), and labels each hour's peak-load class."),
+         "(usage 1h / 24h / 1 week ago), and labels each hour's peak-load class. "
+         "If your file has no real timestamp, EnergyPulse detects that and switches "
+         "to a feature-based pipeline instead (no lag features, randomized split)."),
         ("3", "Train the models", "models.py",
          "A regression model forecasts next-hour usage; a Random Forest "
          "classifies each hour into Off-Peak / Standard / Peak. Both are tested "
