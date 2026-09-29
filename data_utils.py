@@ -139,6 +139,57 @@ def load_csv_dataset(
     return out.reset_index(drop=True)
 
 
+def load_tabular_dataset(
+    filepath,
+    target_col: str = None,
+) -> pd.DataFrame:
+    """
+    Loads a "feature-based" CSV that does NOT contain a real timestamp --
+    instead it describes each reading with separate columns like Month,
+    Hour, DayOfWeek, Temperature, Occupancy, etc. (a common shape for
+    synthetic/Kaggle "energy consumption" datasets used for straightforward
+    regression rather than genuine time-series forecasting).
+
+    Since there's no real datetime, row order is NOT assumed to be
+    chronological. A synthetic, evenly-spaced `timestamp` column is attached
+    purely so existing charts have something sensible to plot on the x-axis
+    -- it must never be used to compute lag/rolling features, since that
+    would silently encode a false chronological order.
+
+    Returns the raw dataframe (original columns preserved) plus:
+        timestamp   : synthetic, evenly spaced, FOR DISPLAY ONLY
+        consumption : detected target column, renamed to the canonical name
+        building_id : constant 'BLDG_1' (single-building dataset)
+    """
+    df = pd.read_csv(filepath)
+
+    def _find(col_candidates, given):
+        if given and given in df.columns:
+            return given
+        for c in df.columns:
+            if c.lower() in col_candidates:
+                return c
+        return None
+
+    target = _find(
+        ["consumption", "energyconsumption", "meter_reading", "load", "power", "kwh", "mw", "energy"],
+        target_col,
+    )
+    if target is None:
+        raise ValueError(
+            f"Could not auto-detect a target consumption column. "
+            f"Found columns: {list(df.columns)}. Pass target_col= explicitly."
+        )
+
+    df = df.rename(columns={target: "consumption"})
+    df["consumption"] = pd.to_numeric(df["consumption"], errors="coerce")
+    df = df.dropna(subset=["consumption"]).reset_index(drop=True)
+
+    df["timestamp"] = pd.date_range(start="2024-01-01", periods=len(df), freq="h")
+    df["building_id"] = "BLDG_1"
+    return df
+
+
 if __name__ == "__main__":
     df = generate_synthetic_dataset()
     print(df.head())
